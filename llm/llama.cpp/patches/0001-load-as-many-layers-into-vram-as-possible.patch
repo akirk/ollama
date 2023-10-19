@@ -1,0 +1,149 @@
+From 43eb3580f3dde92583833c5410703dec09d3b39b Mon Sep 17 00:00:00 2001
+From: Bruce MacDonald <brucewmacdonald@gmail.com>
+Date: Thu, 19 Oct 2023 18:12:17 -0400
+Subject: [PATCH] load as many layers into vram as possible
+
+---
+ common/common.cpp |  6 +----
+ llama.cpp         | 62 +++++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 61 insertions(+), 7 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index 3e4b8a8..07879e8 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -791,9 +791,7 @@ std::string gpt_random_prompt(std::mt19937 & rng) {
+ struct llama_model_params llama_model_params_from_gpt_params(const gpt_params & params) {
+     auto mparams = llama_model_default_params();
+ 
+-    if (params.n_gpu_layers != -1) {
+-        mparams.n_gpu_layers = params.n_gpu_layers;
+-    }
++    mparams.n_gpu_layers = params.n_gpu_layers;
+     mparams.main_gpu        = params.main_gpu;
+     mparams.tensor_split    = params.tensor_split;
+     mparams.use_mmap        = params.use_mmap;
+@@ -861,8 +859,6 @@ std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_par
+     }
+ 
+     {
+-        LOG("warming up the model with an empty run\n");
+-
+         std::vector<llama_token> tmp = { llama_token_bos(lctx), llama_token_eos(lctx), };
+         llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch), 0, 0));
+         llama_kv_cache_tokens_rm(lctx, -1, -1);
+diff --git a/llama.cpp b/llama.cpp
+index 82b7638..998d73b 100644
+--- a/llama.cpp
++++ b/llama.cpp
+@@ -59,11 +59,13 @@
+ #include <cstdarg>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstdio>
+ #include <cstring>
+ #include <ctime>
+ #include <fstream>
+ #include <initializer_list>
++#include <iostream>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+@@ -72,7 +74,10 @@
+ #include <random>
+ #include <regex>
+ #include <sstream>
++#include <stdexcept>
++#include <string>
+ #include <thread>
++#include <vector>
+ #include <unordered_map>
+ #include <set>
+ #include <forward_list>
+@@ -107,6 +112,34 @@ static void llama_log_callback_default(ggml_log_level level, const char * text,
+ // helpers
+ //
+ 
++int64_t check_vram() {
++    std::string cmd = "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits";
++    FILE* pipe = popen(cmd.c_str(), "r");
++    if (!pipe) {
++        throw std::runtime_error("failed to run nvidia-smi command");
++    }
++
++    char buffer[128];
++    std::string result;
++    while (!feof(pipe)) {
++        if (fgets(buffer, 128, pipe) != nullptr)
++            result += buffer;
++    }
++    pclose(pipe);
++
++    std::istringstream iss(result);
++    std::string line;
++    int64_t free_mib = 0;
++
++    while (std::getline(iss, line)) {
++        line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
++        free_mib += std::stoll(line);
++    }
++
++    // convert to bytes
++    return free_mib * 1024 * 1024;
++}
++
+ static size_t utf8_len(char src) {
+     const size_t lookup[] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 4 };
+     uint8_t highbits = static_cast<uint8_t>(src) >> 4;
+@@ -2492,13 +2525,37 @@ static void llm_load_tensors(
+ 
+                     const uint32_t n_ff = hparams.n_ff;
+ 
++                    int64_t free_bytes = 0;
++		            if (n_gpu_layers < 0) {
++		                #ifdef __linux__
++		                    try {
++		                        free_bytes = check_vram();
++			                    LLAMA_LOG_INFO("free vram %lla MB\n", free_bytes / 1024.0 / 1024.0)
++		                    } catch (const std::exception& e) {
++			                    if (std::string(e.what()) != "failed to run nvidia-smi command") {
++                                    std::cerr << e.what() << std::endl;
++                                }
++                                // NVIDIA driver not installed or no NVIDIA GPU found.
++				                free_bytes = 0;
++                            }
++		                #else
++			                n_gpu_layers = 0;
++		    	        #endif
++		            }
++
+                     const int i_gpu_start = n_layer - n_gpu_layers;
+ 
+                     model.layers.resize(n_layer);
+ 
++                    const int64_t vram_buffer_bytes = 2000; // TODO: validate this buffer size
+                     for (uint32_t i = 0; i < n_layer; ++i) {
+-                        const ggml_backend_type backend = int(i) < i_gpu_start ? GGML_BACKEND_CPU : LLAMA_BACKEND_OFFLOAD; // NOLINT
+-                        const ggml_backend_type backend_split = int(i) < i_gpu_start ? GGML_BACKEND_CPU : LLAMA_BACKEND_OFFLOAD_SPLIT; // NOLINT
++                        ggml_backend_type backend = int(i) < i_gpu_start ? GGML_BACKEND_CPU : LLAMA_BACKEND_OFFLOAD; // NOLINT
++                        ggml_backend_type backend_split = int(i) < i_gpu_start ? GGML_BACKEND_CPU : LLAMA_BACKEND_OFFLOAD_SPLIT; // NOLINT
++                        if (n_gpu_layers < 0 && (free_bytes - vram_weights + vram_buffer_bytes) > 0) {
++			                // automatically load as many layers to vram as possible
++			                backend = LLAMA_BACKEND_OFFLOAD;
++		                    backend_split = LLAMA_BACKEND_OFFLOAD_SPLIT;
++			            }
+ 
+                         auto & layer = model.layers[i];
+ 
+@@ -2520,6 +2577,7 @@ static void llm_load_tensors(
+                                 ggml_nbytes(layer.attn_norm) + ggml_nbytes(layer.wq) + ggml_nbytes(layer.wk)       +
+                                 ggml_nbytes(layer.wv)        + ggml_nbytes(layer.wo) + ggml_nbytes(layer.ffn_norm) +
+                                 ggml_nbytes(layer.w1)        + ggml_nbytes(layer.w2) + ggml_nbytes(layer.w3);
++                            free_bytes -= vram_weights;
+                         }
+                     }
+                 } break;
+-- 
+2.39.2 (Apple Git-143)
+

@@ -196,67 +196,6 @@ type llama struct {
 	Running
 }
 
-var errNoGPU = errors.New("nvidia-smi command failed")
-
-// CheckVRAM returns the free VRAM in bytes on Linux machines with NVIDIA GPUs
-func CheckVRAM() (int64, error) {
-	cmd := exec.Command("nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits")
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	err := cmd.Run()
-	if err != nil {
-		return 0, errNoGPU
-	}
-
-	var freeMiB int64
-	scanner := bufio.NewScanner(&stdout)
-	for scanner.Scan() {
-		line := scanner.Text()
-		vram, err := strconv.ParseInt(strings.TrimSpace(line), 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("failed to parse available VRAM: %v", err)
-		}
-
-		freeMiB += vram
-	}
-
-	freeBytes := freeMiB * 1024 * 1024
-	if freeBytes < 2*format.GigaByte {
-		log.Printf("less than 2 GB VRAM available, falling back to CPU only")
-		freeMiB = 0
-	}
-
-	return freeBytes, nil
-}
-
-func NumGPU(numLayer, fileSizeBytes int64, opts api.Options) int {
-	if opts.NumGPU != -1 {
-		return opts.NumGPU
-	}
-	if runtime.GOOS == "linux" {
-		freeBytes, err := CheckVRAM()
-		if err != nil {
-			if err.Error() != "nvidia-smi command failed" {
-				log.Print(err.Error())
-			}
-			// nvidia driver not installed or no nvidia GPU found
-			return 0
-		}
-
-		// Calculate bytes per layer
-		// TODO: this is a rough heuristic, better would be to calculate this based on number of layers and context size
-		bytesPerLayer := fileSizeBytes / numLayer
-
-		// max number of layers we can fit in VRAM, subtract 8% to prevent consuming all available VRAM and running out of memory
-		layers := int(freeBytes/bytesPerLayer) * 92 / 100
-		log.Printf("%d MB VRAM available, loading up to %d GPU layers", freeBytes/(1024*1024), layers)
-
-		return layers
-	}
-	// default to enable metal on macOS
-	return 1
-}
-
 // StatusWriter is a writer that captures error messages from the llama runner process
 type StatusWriter struct {
 	ErrCh      chan error
@@ -286,23 +225,22 @@ func (w *StatusWriter) Write(b []byte) (int, error) {
 }
 
 func newLlama(model string, adapters []string, runners []ModelRunner, numLayers int64, opts api.Options) (*llama, error) {
-	fileInfo, err := os.Stat(model)
-	if err != nil {
-		return nil, err
-	}
-
 	if len(adapters) > 1 {
 		return nil, errors.New("ollama supports only one lora adapter, but multiple were provided")
 	}
 
-	numGPU := NumGPU(numLayers, fileInfo.Size(), opts)
+	if opts.NumGPU == -1 && runtime.GOOS == "darwin" {
+		// default to enable metal on macOS
+		opts.NumGPU = 1
+	}
+
 	params := []string{
 		"--model", model,
 		"--ctx-size", fmt.Sprintf("%d", opts.NumCtx),
 		"--rope-freq-base", fmt.Sprintf("%f", opts.RopeFrequencyBase),
 		"--rope-freq-scale", fmt.Sprintf("%f", opts.RopeFrequencyScale),
 		"--batch-size", fmt.Sprintf("%d", opts.NumBatch),
-		"--n-gpu-layers", fmt.Sprintf("%d", numGPU),
+		"--n-gpu-layers", fmt.Sprintf("%d", opts.NumGPU),
 		"--embedding",
 	}
 
